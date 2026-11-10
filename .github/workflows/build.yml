@@ -33,6 +33,9 @@ jobs:
         with:
           combine: true
           target: ${{ matrix.config.target }}
+          # pin bindings to the snapshot matching Geode v5.11.2 and build codegen from it
+          bindings-ref: 1605f500d053f8de122bf5c7dc6d17c24866e02e
+          configure-args: -DSKIP_BUILDING_CODEGEN=OFF
 
   package:
     name: Package builds
