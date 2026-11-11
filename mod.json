@@ -7,13 +7,60 @@
 		"ios": "2.2081"
 	},
 	"id": "joe.click-indicator",
-	"name": "Click Indicator",
-	"version": "v1.0.0",
+	"name": "Click Guide",
+	"version": "v2.0.0",
 	"developer": "Joe",
-	"description": "Rhythm-game style click indicator: clicks scroll up a track with a PERFECT popup. No sound effects.",
+	"description": "Rhythm-game style guide that shows when to click, using a route recorded from your own completion. No sound effects.",
 	"settings": {
 		"enabled": {
 			"name": "Enabled",
+			"type": "bool",
+			"default": true
+		},
+		"approach-time": {
+			"name": "Note Approach Time (seconds)",
+			"description": "How early notes appear before you need to click.",
+			"type": "float",
+			"default": 1.0,
+			"min": 0.3,
+			"max": 3.0,
+			"control": {
+				"slider": true
+			}
+		},
+		"perfect-window": {
+			"name": "PERFECT Window (ms)",
+			"type": "float",
+			"default": 35.0,
+			"min": 5.0,
+			"max": 100.0,
+			"control": {
+				"slider": true
+			}
+		},
+		"great-window": {
+			"name": "GREAT Window (ms)",
+			"type": "float",
+			"default": 80.0,
+			"min": 10.0,
+			"max": 200.0,
+			"control": {
+				"slider": true
+			}
+		},
+		"overwrite-route": {
+			"name": "Re-record On Every Completion",
+			"description": "If off, a level keeps the first route you recorded.",
+			"type": "bool",
+			"default": true
+		},
+		"show-judgement": {
+			"name": "Show PERFECT/GREAT/MISS Above Track",
+			"type": "bool",
+			"default": true
+		},
+		"floating-judgement": {
+			"name": "Floating Text On Player",
 			"type": "bool",
 			"default": true
 		},
@@ -56,26 +103,6 @@
 			"control": {
 				"slider": true
 			}
-		},
-		"scroll-speed": {
-			"name": "Scroll Speed",
-			"type": "float",
-			"default": 140.0,
-			"min": 40.0,
-			"max": 400.0,
-			"control": {
-				"slider": true
-			}
-		},
-		"show-perfect": {
-			"name": "Show PERFECT Above Track",
-			"type": "bool",
-			"default": true
-		},
-		"floating-perfect": {
-			"name": "Floating PERFECT On Player",
-			"type": "bool",
-			"default": true
 		}
 	}
 }
