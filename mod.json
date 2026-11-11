@@ -8,9 +8,9 @@
 	},
 	"id": "joe.click-indicator",
 	"name": "Click Guide",
-	"version": "v2.0.0",
+	"version": "v2.1.0",
 	"developer": "Joe",
-	"description": "Rhythm-game style guide that shows when to click, using a route recorded from your own completion. No sound effects.",
+	"description": "Rhythm-game style guide that shows when to click. Uses your own completions, bot macros (.gdr/.gdr2), or an orb scan. No sound effects.",
 	"settings": {
 		"enabled": {
 			"name": "Enabled",
@@ -51,6 +51,12 @@
 		"overwrite-route": {
 			"name": "Re-record On Every Completion",
 			"description": "If off, a level keeps the first route you recorded.",
+			"type": "bool",
+			"default": true
+		},
+		"orb-scan": {
+			"name": "Orb Scan When No Route",
+			"description": "For levels without a route, put a note on every orb so you get some guidance.",
 			"type": "bool",
 			"default": true
 		},

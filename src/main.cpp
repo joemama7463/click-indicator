@@ -1,6 +1,10 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/PauseLayer.hpp>
+#include <Geode/utils/async.hpp>
+#include <Geode/utils/file.hpp>
+#include "macro.hpp"
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -39,13 +43,47 @@ namespace {
             : fmt::format("local_{}", std::hash<std::string>{}(std::string(level->m_levelName.c_str())));
         return dir / (key + ".txt");
     }
+
+    bool writeRoute(std::filesystem::path const& path, Holds const& holds) {
+        std::ofstream out(path, std::ios::trunc);
+        if (!out) return false;
+        for (auto const& [p, r] : holds) out << fmt::format("{:.6f} {:.6f}\n", p, std::max(p, r));
+        return static_cast<bool>(out);
+    }
+
+    // horizontal speed (units per second) for the player's current speed setting
+    float unitsPerSecond(PlayerObject* p) {
+        static constexpr std::pair<float, float> table[] = {
+            { 0.7f, 251.16f }, { 0.9f, 311.58f }, { 1.1f, 387.42f }, { 1.3f, 468.0f }, { 1.6f, 576.0f },
+        };
+        float best = 311.58f, diff = 99.f;
+        for (auto [k, v] : table) {
+            if (std::abs(p->m_playerSpeed - k) < diff) { diff = std::abs(p->m_playerSpeed - k); best = v; }
+        }
+        return best;
+    }
+
+    bool isOrb(GameObjectType t) {
+        switch (t) {
+            case GameObjectType::YellowJumpRing: case GameObjectType::PinkJumpRing:
+            case GameObjectType::GravityRing:    case GameObjectType::RedJumpRing:
+            case GameObjectType::GreenRing:      case GameObjectType::DropRing:
+            case GameObjectType::CustomRing:     case GameObjectType::DashRing:
+            case GameObjectType::GravityDashRing: case GameObjectType::SpiderOrb:
+            case GameObjectType::TeleportOrb:
+                return true;
+            default:
+                return false;
+        }
+    }
 }
 
 enum class NoteState { Pending, Perfect, Great, Missed };
 
 struct Note {
-    double press;
+    double press;     // time notes (from a route or macro)
     double release;
+    float x = -1.f;   // orb-scan notes are placed by position instead (x >= 0)
     NoteState state = NoteState::Pending;
     double judgedAt = 0.0;
 };
@@ -61,6 +99,10 @@ class ClickGuide : public CCNode {
     CCLabelBMFont* m_status = nullptr;
 
     std::vector<Note> m_route;
+    PlayLayer* m_pl = nullptr; // parent, not retained
+    bool m_orbMode = false;
+    float m_playerX = 0.f;
+    float m_speed = 311.58f;
     std::vector<Input> m_rec;
     std::filesystem::path m_path;
 
@@ -72,9 +114,10 @@ class ClickGuide : public CCNode {
     double m_great = 0.08;
 
 public:
-    static ClickGuide* create(GJGameLevel* level) {
+    static ClickGuide* create(PlayLayer* pl) {
         auto ret = new ClickGuide();
-        if (ret->init(level)) {
+        ret->m_pl = pl;
+        if (ret->init(pl->m_level)) {
             ret->autorelease();
             return ret;
         }
@@ -90,7 +133,6 @@ public:
         m_great    = std::max(m_perfect, getFloat("great-window") / 1000.0);
 
         m_path = routePath(level);
-        this->loadRoute();
 
         m_draw = CCDrawNode::create();
         this->addChild(m_draw);
@@ -106,11 +148,24 @@ public:
         m_status->setScale(0.3f);
         m_status->setPosition({ 0.f, -42.f });
         this->addChild(m_status, 2);
-        this->updateStatus();
+        this->reloadRoute();
 
         this->setID("click-guide"_spr);
         this->scheduleUpdate();
         return true;
+    }
+
+    double pressOf(Note const& n) const {
+        if (n.x < 0) return n.press;
+        return m_now + (n.x - m_playerX) / m_speed;
+    }
+    double releaseOf(Note const& n) const {
+        return pressOf(n) + (n.release - n.press);
+    }
+
+    void reloadRoute() {
+        this->loadRoute();
+        this->updateStatus();
     }
 
     // ---- input from the game ----
@@ -123,10 +178,12 @@ public:
         // judge against the closest pending note inside the window
         Note* best = nullptr;
         double bestDiff = m_great + 1.0;
+        this->sample();
         for (auto& n : m_route) {
-            if (n.press > t + m_great) break;
+            double np = pressOf(n);
+            if (np > t + m_great) break;
             if (n.state != NoteState::Pending) continue;
-            double d = std::abs(n.press - t);
+            double d = std::abs(np - t);
             if (d <= m_great && d < bestDiff) { best = &n; bestDiff = d; }
         }
         if (best) {
@@ -153,23 +210,22 @@ public:
         m_held = false;
 
         // notes ahead of the respawn point can be hit again
-        for (auto& n : m_route) {
-            if (n.press >= t - m_great) n.state = NoteState::Pending;
-        }
         m_now = t;
+        this->sample();
+        for (auto& n : m_route) {
+            bool ahead = n.x < 0 ? n.press >= t - m_great : n.x >= m_playerX - 5.f;
+            if (ahead) n.state = NoteState::Pending;
+        }
     }
 
     void onComplete(double t, bool validRun) {
         if (!m_rec.empty() && m_rec.back().release < 0) m_rec.back().release = t;
         if (!validRun || m_rec.empty()) return;
-        if (!m_route.empty() && !getBool("overwrite-route")) return;
+        if (!m_route.empty() && !m_orbMode && !getBool("overwrite-route")) return;
 
-        std::ofstream out(m_path, std::ios::trunc);
-        if (!out) return;
-        for (auto const& i : m_rec) {
-            out << fmt::format("{:.6f} {:.6f}\n", i.press, std::max(i.release, i.press));
-        }
-        out.close();
+        Holds holds;
+        for (auto const& i : m_rec) holds.push_back({ i.press, i.release });
+        if (!writeRoute(m_path, holds)) return;
 
         this->loadRoute();
         m_status->setString("ROUTE SAVED");
@@ -178,11 +234,12 @@ public:
     }
 
     void update(float) override {
-        if (auto pl = PlayLayer::get()) m_now = pl->m_gameState.m_levelTime;
+        this->sample();
 
         for (auto& n : m_route) {
-            if (n.press > m_now) break;
-            if (n.state == NoteState::Pending && m_now - n.press > m_great) {
+            double np = pressOf(n);
+            if (np > m_now) break;
+            if (n.state == NoteState::Pending && m_now - np > m_great) {
                 n.state = NoteState::Missed;
                 n.judgedAt = m_now;
                 this->showJudgement(NoteState::Missed);
@@ -192,18 +249,57 @@ public:
     }
 
 private:
+    void sample() {
+        auto pl = m_pl;
+        if (!pl) return;
+        m_now = pl->m_gameState.m_levelTime;
+        if (pl->m_player1) {
+            m_playerX = pl->m_player1->getPositionX();
+            m_speed = unitsPerSecond(pl->m_player1);
+        }
+    }
+
     void loadRoute() {
         m_route.clear();
-        std::ifstream in(m_path);
-        double p, r;
-        while (in >> p >> r) m_route.push_back({ p, std::max(r, p) });
-        std::sort(m_route.begin(), m_route.end(),
-            [](Note const& a, Note const& b) { return a.press < b.press; });
+        m_orbMode = false;
+        {
+            std::ifstream in(m_path);
+            double p, r;
+            while (in >> p >> r) m_route.push_back({ p, std::max(r, p) });
+        }
+        if (m_route.empty() && getBool("orb-scan")) this->scanOrbs();
+        std::sort(m_route.begin(), m_route.end(), [](Note const& a, Note const& b) {
+            return a.x < 0 ? a.press < b.press : a.x < b.x;
+        });
+    }
+
+    // fallback: put a note on every orb in the level
+    void scanOrbs() {
+        auto pl = m_pl;
+        if (!pl || !pl->m_objects || pl->m_isPlatformer) return;
+        std::vector<float> xs;
+        for (auto obj : CCArrayExt<GameObject*>(pl->m_objects)) {
+            if (obj && isOrb(obj->m_objectType)) xs.push_back(obj->getPositionX() - 6.f);
+        }
+        std::sort(xs.begin(), xs.end());
+        float last = -1000.f;
+        for (float x : xs) {
+            if (x - last < 5.f) continue; // stacked orbs count once
+            last = x;
+            Note n{ 0.0, 0.05 };
+            n.x = std::max(0.f, x);
+            m_route.push_back(n);
+        }
+        m_orbMode = !m_route.empty();
     }
 
     void updateStatus() {
-        if (m_route.empty()) {
-            m_status->setString("NO ROUTE YET - BEAT THE LEVEL TO RECORD ONE");
+        if (m_orbMode) {
+            m_status->setString("ORB SCAN - LOAD A MACRO FOR EVERY CLICK");
+            m_status->setColor({ 255, 200, 90 });
+            m_status->setOpacity(static_cast<GLubyte>(200 * m_alpha));
+        } else if (m_route.empty()) {
+            m_status->setString("NO ROUTE - BEAT IT OR LOAD A MACRO (PAUSE MENU)");
             m_status->setColor({ 200, 200, 200 });
             m_status->setOpacity(static_cast<GLubyte>(200 * m_alpha));
         } else {
@@ -227,7 +323,7 @@ private:
         }
 
         // small floating copy above the player
-        auto pl = PlayLayer::get();
+        auto pl = m_pl;
         if (getBool("floating-judgement") && pl && pl->m_player1 && pl->m_objectLayer) {
             auto lbl = CCLabelBMFont::create(text, "bigFont.fnt");
             lbl->setColor(color);
@@ -273,8 +369,9 @@ private:
         double windowEnd   = m_now + m_approach;
 
         for (auto const& n : m_route) {
-            if (n.press > windowEnd) break;
-            if (n.release < windowStart && n.press < windowStart) continue;
+            double np = pressOf(n), nr = releaseOf(n);
+            if (np > windowEnd) break;
+            if (nr < windowStart && np < windowStart) continue;
 
             float alphaMul = 1.f;
             ccColor4F bar, body, edge;
@@ -301,8 +398,8 @@ private:
                     break;
             }
 
-            float y0 = yFor(n.press);
-            float y1 = yFor(n.release);
+            float y0 = yFor(np);
+            float y1 = yFor(nr);
             // body for holds, then the bar marking the moment to click
             quad(y0 + kBarThick, std::max(y1, y0 + kBarThick), 0.42f, body);
             quad(y0, y0 + kBarThick, 0.98f, bar, 0.6f, edge);
@@ -333,7 +430,7 @@ class $modify(CGPlayLayer, PlayLayer) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
         if (!getBool("enabled")) return true;
 
-        auto guide = ClickGuide::create(level);
+        auto guide = ClickGuide::create(this);
         auto win = CCDirector::get()->getWinSize();
         guide->setPosition({ win.width * getFloat("pos-x"), win.height * getFloat("pos-y") });
         guide->setScale(getFloat("scale"));
@@ -361,5 +458,76 @@ class $modify(CGGameLayer, GJBaseGameLayer) {
             double t = m_gameState.m_levelTime;
             down ? g->press(t) : g->release(t);
         }
+    }
+};
+
+class $modify(CGPauseLayer, PauseLayer) {
+    void customSetup() {
+        PauseLayer::customSetup();
+        if (!getGuide()) return;
+
+        auto menu = CCMenu::create();
+        menu->setID("click-guide-menu"_spr);
+        auto win = CCDirector::get()->getWinSize();
+        menu->setPosition({ 70.f, 30.f });
+
+        auto loadSpr = ButtonSprite::create("Load Macro", "goldFont.fnt", "GJ_button_01.png", 0.7f);
+        loadSpr->setScale(0.6f);
+        auto loadBtn = CCMenuItemSpriteExtra::create(loadSpr, this, menu_selector(CGPauseLayer::onLoadMacro));
+        loadBtn->setPosition({ 0.f, 0.f });
+        menu->addChild(loadBtn);
+
+        auto clearSpr = ButtonSprite::create("Clear Route", "goldFont.fnt", "GJ_button_06.png", 0.7f);
+        clearSpr->setScale(0.6f);
+        auto clearBtn = CCMenuItemSpriteExtra::create(clearSpr, this, menu_selector(CGPauseLayer::onClearRoute));
+        clearBtn->setPosition({ 0.f, 28.f });
+        menu->addChild(clearBtn);
+
+        (void)win;
+        this->addChild(menu, 10);
+    }
+
+    void onLoadMacro(CCObject*) {
+        async::spawn(file::pick(file::PickMode::OpenFile, file::FilePickOptions {}),
+            [](file::PickResult result) {
+                if (result.isErr()) {
+                    FLAlertLayer::create("Click Guide", result.unwrapErr(), "OK")->show();
+                    return;
+                }
+                auto picked = std::move(result).unwrap();
+                if (!picked) return; // cancelled
+
+                auto pl = PlayLayer::get();
+                if (!pl) return;
+
+                MacroInfo info;
+                auto err = loadMacro(*picked, info);
+                if (!err.empty()) {
+                    FLAlertLayer::create("Click Guide", err, "OK")->show();
+                    return;
+                }
+                if (!writeRoute(routePath(pl->m_level), info.holds)) {
+                    FLAlertLayer::create("Click Guide", "Couldn't save the route.", "OK")->show();
+                    return;
+                }
+                if (auto g = getGuide()) g->reloadRoute();
+
+                std::string msg = fmt::format("Loaded <cg>{}</c> clicks from a {} macro.", info.holds.size(), info.format);
+                int id = pl->m_level->m_levelID.value();
+                if (info.levelID != 0 && id > 0 && static_cast<int>(info.levelID) != id) {
+                    msg += fmt::format("\n<cr>Warning:</c> this macro was recorded on a different level ({}).",
+                        info.levelName.empty() ? std::to_string(info.levelID) : info.levelName);
+                }
+                FLAlertLayer::create("Click Guide", msg, "OK")->show();
+            });
+    }
+
+    void onClearRoute(CCObject*) {
+        auto pl = PlayLayer::get();
+        if (!pl) return;
+        std::error_code ec;
+        std::filesystem::remove(routePath(pl->m_level), ec);
+        if (auto g = getGuide()) g->reloadRoute();
+        FLAlertLayer::create("Click Guide", "Route cleared for this level.", "OK")->show();
     }
 };
